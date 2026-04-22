@@ -259,6 +259,17 @@ def load_invoices(
 
 # --- Joining + rollups --------------------------------------------------
 
+def _ensure_cols(df: pd.DataFrame, cols: dict[str, Any]) -> pd.DataFrame:
+    """Return ``df`` with any missing columns from ``cols`` added with the
+    given default value. Tolerates an entirely empty DataFrame (e.g. when a
+    Cliniko endpoint returned zero rows and the parquet has no schema)."""
+    out = df.copy() if not df.empty else pd.DataFrame()
+    for col, default in cols.items():
+        if col not in out.columns:
+            out[col] = default
+    return out
+
+
 def _resolve_referral(
     referral_sources: pd.DataFrame,
     referral_source_types: pd.DataFrame,
@@ -273,6 +284,27 @@ def _resolve_referral(
             columns=["patient_id", "referral_type", "referral_name"]
         )
 
+    # Guard against empty / schema-less snapshots for the three lookup
+    # tables. Without this, a merge on a missing column raises KeyError
+    # and takes the whole dashboard down.
+    referral_sources = _ensure_cols(
+        referral_sources,
+        {
+            "patient_id": pd.NA,
+            "referral_source_type_id": pd.NA,
+            "referrer_type": pd.NA,
+            "referrer_id": pd.NA,
+            "referral_source_id": pd.NA,
+        },
+    )
+    referral_source_types = _ensure_cols(
+        referral_source_types,
+        {"referral_source_type_id": pd.NA, "referral_type_name": pd.NA},
+    )
+    contacts = _ensure_cols(
+        contacts, {"contact_id": pd.NA, "contact_name": pd.NA}
+    )
+
     rs = referral_sources.merge(
         referral_source_types,
         on="referral_source_type_id",
@@ -285,7 +317,7 @@ def _resolve_referral(
     patient_names = patients_named[["patient_id", "patient_name"]].rename(
         columns={"patient_id": "referrer_id", "patient_name": "_ref_patient_name"}
     )
-    contact_names = contacts.rename(
+    contact_names = contacts[["contact_id", "contact_name"]].rename(
         columns={"contact_id": "referrer_id", "contact_name": "_ref_contact_name"}
     )
 
@@ -310,7 +342,6 @@ def _resolve_referral(
         "patient_id", keep="last"
     )
     return rs[["patient_id", "referral_type", "referral_name"]]
-
 
 def build_invoice_view(
     invoices: pd.DataFrame,
