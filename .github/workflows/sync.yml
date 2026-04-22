@@ -1,1 +1,47 @@
+name: Sync Cliniko data
 
+"on":
+  schedule:
+    - cron: "0 8 * * 5"
+  workflow_dispatch:
+
+concurrency:
+  group: cliniko-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Cliniko sync
+        env:
+          CLINIKO_API_KEY: ${{ secrets.CLINIKO_API_KEY }}
+          CLINIKO_USER_AGENT: "EnhancePhysio-Dashboard-Sync (matt@enhance.physio)"
+        run: python sync.py
+
+      - name: Commit updated snapshots
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/*.parquet
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(sync): refresh Cliniko snapshots ($(date -u +'%Y-%m-%d %H:%MZ'))"
+            git push
+          fi
