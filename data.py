@@ -22,10 +22,20 @@ def _id(x: Any) -> str | None:
     return str(x)
 
 
-def _link_id(obj: dict | None, key: str = "self") -> str | None:
-    """Extract the numeric id from a Cliniko "links" object."""
+def _link_id(obj, key: str = "self") -> str | None:
+    """Extract the numeric id from a Cliniko relationship field.
+
+    Cliniko is inconsistent: some endpoints return relationships as a nested
+    object like ``{"links": {"self": "https://…/resource/123"}}``, while
+    others (notably ``/patients``'s ``referral_source``) return a plain URL
+    string. Handle both shapes.
+    """
     if not obj:
         return None
+    if isinstance(obj, str):
+        # Plain URL form: ".../referral_sources/12345"
+        tail = obj.rsplit("/", 1)[-1].strip()
+        return tail or None
     link = obj.get("links", {}).get(key)
     if not link:
         return None
