@@ -32,9 +32,13 @@ from data import (
     DATA_DIR,
     PATIENTS_PQ,
     REFERRAL_SOURCES_PQ,
+    REFERRAL_SOURCE_TYPES_PQ,
+    CONTACTS_PQ,
     BUSINESSES_PQ,
     fetch_businesses_live,
+    fetch_contacts_live,
     fetch_patients_live,
+    fetch_referral_source_types_live,
     fetch_referral_sources_live,
 )
 
@@ -65,12 +69,34 @@ def _sync_businesses(client: ClinikoClient) -> None:
 
 
 def _sync_referral_sources(client: ClinikoClient) -> None:
-    print("→ Fetching referral sources…")
+    print("→ Fetching referral sources (per-patient junction records)…")
     t0 = time.time()
     df = fetch_referral_sources_live(client)
     df.to_parquet(REFERRAL_SOURCES_PQ, index=False)
     print(
         f"  ✓ {len(df)} referral sources → {REFERRAL_SOURCES_PQ.name} "
+        f"({time.time() - t0:.1f}s)"
+    )
+
+
+def _sync_referral_source_types(client: ClinikoClient) -> None:
+    print("→ Fetching referral source TYPES (category lookup)…")
+    t0 = time.time()
+    df = fetch_referral_source_types_live(client)
+    df.to_parquet(REFERRAL_SOURCE_TYPES_PQ, index=False)
+    print(
+        f"  ✓ {len(df)} referral source types → "
+        f"{REFERRAL_SOURCE_TYPES_PQ.name} ({time.time() - t0:.1f}s)"
+    )
+
+
+def _sync_contacts(client: ClinikoClient) -> None:
+    print("→ Fetching contacts (named referrers like 'Dr Smith')…")
+    t0 = time.time()
+    df = fetch_contacts_live(client)
+    df.to_parquet(CONTACTS_PQ, index=False)
+    print(
+        f"  ✓ {len(df)} contacts → {CONTACTS_PQ.name} "
         f"({time.time() - t0:.1f}s)"
     )
 
@@ -121,6 +147,8 @@ def main() -> None:
     client = _client_from_env()
 
     _sync_businesses(client)
+    _sync_referral_source_types(client)
+    _sync_contacts(client)
     _sync_referral_sources(client)
     _sync_patients(client)
 
