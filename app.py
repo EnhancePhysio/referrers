@@ -425,14 +425,19 @@ with tab_invoices:
 # data, broken joins, or genuinely no activity in the period.
 
 with st.expander("🔧 Data health diagnostics"):
+    def _safe_nunique(df, col):
+        """Count distinct non-null values of ``col`` in ``df`` — returns 0
+        if the column isn't present (e.g. parquet came back empty)."""
+        if df is None or df.empty or col not in df.columns:
+            return 0
+        return df[col].dropna().nunique()
+
     n_patients = len(patients)
     n_sources = len(referral_sources)
     n_source_types = len(referral_source_types)
     n_contacts = len(contacts)
     n_invoices = len(invoices)
-    n_patients_with_rs = (
-        referral_sources["patient_id"].dropna().nunique() if n_sources else 0
-    )
+    n_patients_with_rs = _safe_nunique(referral_sources, "patient_id")
 
     if invoice_view.empty:
         joined_to_patient = 0
@@ -455,11 +460,34 @@ with st.expander("🔧 Data health diagnostics"):
     col_e.metric("Invoices (period)", f"{n_invoices:,}")
     col_f.metric("Joined to patient", f"{joined_to_patient:,}")
     col_g.metric("Joined to referrer", f"{joined_to_referrer:,}")
-    col_h.metric(
-        "Revenue in period", f"${invoice_view['total_incl_tax'].sum():,.0f}"
+    revenue_total = (
+        invoice_view["total_incl_tax"].sum()
+        if not invoice_view.empty and "total_incl_tax" in invoice_view.columns
+        else 0
     )
+    col_h.metric("Revenue in period", f"${revenue_total:,.0f}")
 
-    st.markdown("**Sample — 5 referral source types (the category list)**")
+    # Show each snapshot's *columns* first — this is how we diagnose a
+    # schema mismatch (e.g. old parquet with different column names).
+    st.markdown("**Snapshot columns** (what's actually in each parquet)")
+    schema_rows = []
+    for name, df in [
+        ("patients", patients),
+        ("referral_sources", referral_sources),
+        ("referral_source_types", referral_source_types),
+        ("contacts", contacts),
+        ("businesses", businesses),
+    ]:
+        schema_rows.append(
+            {
+                "table": name,
+                "rows": len(df),
+                "columns": ", ".join(df.columns.astype(str)) if not df.empty else "(empty)",
+            }
+        )
+    st.dataframe(pd.DataFrame(schema_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("**Sample — referral source types (the category list)**")
     st.dataframe(
         referral_source_types.head(20),
         use_container_width=True,
