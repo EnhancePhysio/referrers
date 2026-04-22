@@ -15,8 +15,10 @@ from data import (
     build_invoice_view,
     channel_rollup,
     load_businesses,
+    load_contacts,
     load_invoices,
     load_patients,
+    load_referral_source_types,
     load_referral_sources,
     referrer_league_table,
 )
@@ -108,6 +110,22 @@ def _referral_sources() -> pd.DataFrame:
         _missing_snapshot_error("referral_sources")
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading referral source types…")
+def _referral_source_types() -> pd.DataFrame:
+    try:
+        return load_referral_source_types(_client())
+    except RuntimeError:
+        _missing_snapshot_error("referral_source_types")
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading contacts…")
+def _contacts() -> pd.DataFrame:
+    try:
+        return load_contacts(_client())
+    except RuntimeError:
+        _missing_snapshot_error("contacts")
+
+
 @st.cache_data(ttl=86400, show_spinner="Loading patients from snapshot…")
 def _patients() -> pd.DataFrame:
     try:
@@ -183,9 +201,18 @@ with st.sidebar:
 # --- Load + shape data ----------------------------------------------------
 
 referral_sources = _referral_sources()
+referral_source_types = _referral_source_types()
+contacts = _contacts()
 patients = _patients()
 invoices = _invoices(start_date, end_date)
-invoice_view = build_invoice_view(invoices, patients, referral_sources, businesses)
+invoice_view = build_invoice_view(
+    invoices,
+    patients,
+    referral_sources,
+    referral_source_types,
+    contacts,
+    businesses,
+)
 
 if clinic_choice != "All":
     invoice_view = invoice_view[invoice_view["business_name"] == clinic_choice]
@@ -399,10 +426,13 @@ with tab_invoices:
 
 with st.expander("🔧 Data health diagnostics"):
     n_patients = len(patients)
-    n_patients_with_rs = patients["referral_source_id"].notna().sum()
     n_sources = len(referral_sources)
+    n_source_types = len(referral_source_types)
+    n_contacts = len(contacts)
     n_invoices = len(invoices)
-    n_inv_with_patient = invoices["patient_id"].notna().sum()
+    n_patients_with_rs = (
+        referral_sources["patient_id"].dropna().nunique() if n_sources else 0
+    )
 
     if invoice_view.empty:
         joined_to_patient = 0
@@ -411,30 +441,38 @@ with st.expander("🔧 Data health diagnostics"):
         joined_to_patient = invoice_view["patient_name"].fillna("").ne("").sum()
         joined_to_referrer = invoice_view["referral_type"].ne("(none)").sum()
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Patients (snapshot)", f"{n_patients:,}")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Patients", f"{n_patients:,}")
     col_a.caption(
-        f"{n_patients_with_rs:,} with a referral_source_id "
+        f"{n_patients_with_rs:,} have a referral source "
         f"({(n_patients_with_rs / n_patients * 100 if n_patients else 0):.0f}%)"
     )
-    col_b.metric("Referral sources (snapshot)", f"{n_sources:,}")
-    col_c.metric("Invoices (period)", f"{n_invoices:,}")
-    col_c.caption(f"{n_inv_with_patient:,} with a patient_id")
+    col_b.metric("Referral sources", f"{n_sources:,}")
+    col_c.metric("Source types", f"{n_source_types:,}")
+    col_d.metric("Contacts", f"{n_contacts:,}")
 
-    col_d, col_e, col_f = st.columns(3)
-    col_d.metric("Joined to patient", f"{joined_to_patient:,}")
-    col_e.metric("Joined to referrer", f"{joined_to_referrer:,}")
-    col_f.metric(
+    col_e, col_f, col_g, col_h = st.columns(4)
+    col_e.metric("Invoices (period)", f"{n_invoices:,}")
+    col_f.metric("Joined to patient", f"{joined_to_patient:,}")
+    col_g.metric("Joined to referrer", f"{joined_to_referrer:,}")
+    col_h.metric(
         "Revenue in period", f"${invoice_view['total_incl_tax'].sum():,.0f}"
     )
 
-    st.markdown("**Sample — 5 patients (raw snapshot)**")
-    st.dataframe(patients.head(5), use_container_width=True, hide_index=True)
+    st.markdown("**Sample — 5 referral source types (the category list)**")
+    st.dataframe(
+        referral_source_types.head(20),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.markdown("**Sample — 5 referral sources (raw snapshot)**")
+    st.markdown("**Sample — 5 referral sources (per-patient records)**")
     st.dataframe(
         referral_sources.head(5), use_container_width=True, hide_index=True
     )
+
+    st.markdown("**Sample — 5 contacts**")
+    st.dataframe(contacts.head(5), use_container_width=True, hide_index=True)
 
     st.markdown("**Sample — 5 raw invoices (pre-join)**")
     st.dataframe(invoices.head(5), use_container_width=True, hide_index=True)
