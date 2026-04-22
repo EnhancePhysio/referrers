@@ -1,12 +1,28 @@
 """Data loading + joining layer.
 
 Prefers ``data/*.parquet`` snapshots (populated by ``sync.py`` / GitHub
-Actions) for the slow-to-fetch Cliniko resources: patients, referral
-sources, and businesses. Falls back to live API if a snapshot is missing
-(e.g. very first run before the action has executed).
+Actions) for the slow-to-fetch Cliniko resources. Falls back to live API
+if a snapshot is missing.
 
-Invoices are always fetched live — they're small per-quarter and always
-period-specific, so snapshotting adds little.
+# Cliniko's referral model (important — not obvious from field names):
+
+``/referral_sources``        — NOT a list of referrer types. It's a
+                               per-patient JUNCTION table: each record
+                               links one patient to a referral_source_type
+                               and optionally to a specific referrer
+                               (another Patient or a Contact).
+
+``/referral_source_types``   — the small lookup table of type names
+                               ("Google", "Contact", "Patient", "Social
+                               Media", "Sports Club", …).
+
+``/contacts``                — Contacts (e.g. "Dr Smith", "Wodonga
+                               Raiders"). Used as named referrers when a
+                               patient's referral_source has
+                               ``referrer_type == "Contact"``.
+
+Invoices are always fetched live — they're period-specific and small
+per-quarter, so snapshotting adds little.
 """
 from __future__ import annotations
 
@@ -22,6 +38,8 @@ from cliniko_client import ClinikoClient
 DATA_DIR = Path(__file__).parent / "data"
 PATIENTS_PQ = DATA_DIR / "patients.parquet"
 REFERRAL_SOURCES_PQ = DATA_DIR / "referral_sources.parquet"
+REFERRAL_SOURCE_TYPES_PQ = DATA_DIR / "referral_source_types.parquet"
+CONTACTS_PQ = DATA_DIR / "contacts.parquet"
 BUSINESSES_PQ = DATA_DIR / "businesses.parquet"
 
 
@@ -37,12 +55,13 @@ def _id(x: Any) -> str | None:
 def _link_id(obj: Any, key: str = "self") -> str | None:
     """Extract the numeric id from a Cliniko relationship field, robustly.
 
-    Cliniko is inconsistent across endpoints: sometimes a relationship is a
-    nested object ``{"links": {"self": "https://…/resource/123"}}``,
-    sometimes it's a plain URL string (notably ``/patients``'s
-    ``referral_source``), sometimes it's missing/None, and in rare cases
-    it may be a shape we don't expect. Handle all of that without raising
-    — a single weird record shouldn't blow up a full-practice sync.
+    Cliniko returns relationships in multiple shapes across endpoints:
+    - nested object: ``{"links": {"self": "https://…/resource/123"}}``
+    - plain URL string: ``"https://…/resource/123"``
+    - missing / None / unexpected types
+
+    Handles all of them without raising — one weird record shouldn't blow
+    up a full-practice sync.
     """
     if obj is None:
         return None
@@ -65,7 +84,6 @@ def _patient_row(p: dict) -> dict:
         "patient_id": _id(p.get("id")),
         "first_name": p.get("first_name") or "",
         "last_name": p.get("last_name") or "",
-        "referral_source_id": _link_id(p.get("referral_source")),
         "created_at": p.get("created_at"),
         "updated_at": p.get("updated_at"),
     }
@@ -79,13 +97,37 @@ def _business_row(b: dict) -> dict:
 
 
 def _referral_source_row(r: dict) -> dict:
-    rs_type = r.get("referral_source_type")
-    if not isinstance(rs_type, dict):
-        rs_type = {}
+    """A /referral_sources record = one patient ↔ one referrer link."""
     return {
         "referral_source_id": _id(r.get("id")),
-        "referral_type": rs_type.get("name") or r.get("type") or "",
-        "referral_name": (r.get("name") or "").strip() or "(blank)",
+        "patient_id": _link_id(r.get("patient")),
+        "referral_source_type_id": _link_id(r.get("referral_source_type")),
+        # referrer_type is "Patient", "Contact", or null. When null, the
+        # type itself IS the referrer (e.g. "Google Ads" — no named
+        # person/contact).
+        "referrer_type": r.get("referrer_type"),
+        "referrer_id": _link_id(r.get("referrer")),
+        "subcategory": r.get("subcategory") or "",
+        "notes": r.get("notes") or "",
+    }
+
+
+def _referral_source_type_row(r: dict) -> dict:
+    return {
+        "referral_source_type_id": _id(r.get("id")),
+        "referral_type_name": (r.get("name") or "").strip() or "(blank)",
+    }
+
+
+def _contact_row(c: dict) -> dict:
+    first = (c.get("first_name") or "").strip()
+    last = (c.get("last_name") or "").strip()
+    company = (c.get("company") or "").strip()
+    # Prefer first+last, then company, then fall back to a placeholder.
+    name = " ".join(x for x in (first, last) if x) or company or "(unnamed)"
+    return {
+        "contact_id": _id(c.get("id")),
+        "contact_name": name,
     }
 
 
@@ -99,6 +141,16 @@ def fetch_referral_sources_live(client: ClinikoClient) -> pd.DataFrame:
     return pd.DataFrame(
         [_referral_source_row(r) for r in client.referral_sources()]
     )
+
+
+def fetch_referral_source_types_live(client: ClinikoClient) -> pd.DataFrame:
+    return pd.DataFrame(
+        [_referral_source_type_row(t) for t in client.referral_source_types()]
+    )
+
+
+def fetch_contacts_live(client: ClinikoClient) -> pd.DataFrame:
+    return pd.DataFrame([_contact_row(c) for c in client.contacts()])
 
 
 def fetch_patients_live(
@@ -116,40 +168,46 @@ def fetch_patients_live(
 
 # --- Snapshot-first loaders (used by the dashboard) ---------------------
 
-def load_businesses(client: ClinikoClient | None = None) -> pd.DataFrame:
-    if BUSINESSES_PQ.exists():
-        return pd.read_parquet(BUSINESSES_PQ)
+def _load_or_fetch(
+    path: Path,
+    client: ClinikoClient | None,
+    live_fetcher,
+) -> pd.DataFrame:
+    if path.exists():
+        return pd.read_parquet(path)
     if client is None:
         raise RuntimeError(
-            f"{BUSINESSES_PQ} not found — run `python sync.py` first."
+            f"{path} not found — run `python sync.py` first."
         )
-    return fetch_businesses_live(client)
+    return live_fetcher(client)
+
+
+def load_businesses(client: ClinikoClient | None = None) -> pd.DataFrame:
+    return _load_or_fetch(BUSINESSES_PQ, client, fetch_businesses_live)
 
 
 def load_referral_sources(client: ClinikoClient | None = None) -> pd.DataFrame:
-    if REFERRAL_SOURCES_PQ.exists():
-        return pd.read_parquet(REFERRAL_SOURCES_PQ)
-    if client is None:
-        raise RuntimeError(
-            f"{REFERRAL_SOURCES_PQ} not found — run `python sync.py` first."
-        )
-    return fetch_referral_sources_live(client)
+    return _load_or_fetch(REFERRAL_SOURCES_PQ, client, fetch_referral_sources_live)
+
+
+def load_referral_source_types(
+    client: ClinikoClient | None = None,
+) -> pd.DataFrame:
+    return _load_or_fetch(
+        REFERRAL_SOURCE_TYPES_PQ, client, fetch_referral_source_types_live
+    )
+
+
+def load_contacts(client: ClinikoClient | None = None) -> pd.DataFrame:
+    return _load_or_fetch(CONTACTS_PQ, client, fetch_contacts_live)
 
 
 def load_patients(client: ClinikoClient | None = None) -> pd.DataFrame:
-    if PATIENTS_PQ.exists():
-        return pd.read_parquet(PATIENTS_PQ)
-    if client is None:
-        raise RuntimeError(
-            f"{PATIENTS_PQ} not found — run `python sync.py` first."
-        )
-    return fetch_patients_live(client)
+    return _load_or_fetch(PATIENTS_PQ, client, fetch_patients_live)
 
 
 # --- Invoices (always live) ---------------------------------------------
 
-# Cliniko invoice status is a small int with a known mapping. We prefer the
-# API-provided `status_description` when present, but fall back to this.
 _STATUS_NAMES = {
     10: "Open",
     20: "Paid",
@@ -166,14 +224,11 @@ def load_invoices(
     rows = client.invoices(start.isoformat(), end.isoformat())
     out = []
     for inv in rows:
-        # Skip soft-deleted invoices — they still come back from the list
-        # endpoint but shouldn't count toward revenue.
         if inv.get("deleted_at"):
             continue
 
-        # Cliniko returns monetary totals as string decimals (e.g. "150.0").
-        # The field on an invoice is `total_amount` (NOT total_including_tax
-        # — that's on invoice items).
+        # Invoice total lives in `total_amount` (string decimal). The
+        # `total_including_tax` field is on invoice ITEMS, not the invoice.
         raw_total = inv.get("total_amount")
         try:
             total = float(raw_total) if raw_total not in (None, "") else 0.0
@@ -204,18 +259,73 @@ def load_invoices(
 
 # --- Joining + rollups --------------------------------------------------
 
+def _resolve_referral(
+    referral_sources: pd.DataFrame,
+    referral_source_types: pd.DataFrame,
+    patients_named: pd.DataFrame,
+    contacts: pd.DataFrame,
+) -> pd.DataFrame:
+    """Flatten each referral_source record into a patient-keyed table
+    carrying ``referral_type`` (category name) and ``referral_name``
+    (specific referrer, or same as type if no named referrer)."""
+    if referral_sources.empty:
+        return pd.DataFrame(
+            columns=["patient_id", "referral_type", "referral_name"]
+        )
+
+    rs = referral_sources.merge(
+        referral_source_types,
+        on="referral_source_type_id",
+        how="left",
+    )
+    rs["referral_type"] = rs["referral_type_name"].fillna("(unknown type)")
+
+    # Resolve the NAME of the specific referrer based on referrer_type.
+    # Merge in the contact names and patient names, then coalesce.
+    patient_names = patients_named[["patient_id", "patient_name"]].rename(
+        columns={"patient_id": "referrer_id", "patient_name": "_ref_patient_name"}
+    )
+    contact_names = contacts.rename(
+        columns={"contact_id": "referrer_id", "contact_name": "_ref_contact_name"}
+    )
+
+    rs = rs.merge(contact_names, on="referrer_id", how="left")
+    rs = rs.merge(patient_names, on="referrer_id", how="left")
+
+    def _name(row):
+        rt = row.get("referrer_type")
+        if rt == "Contact" and isinstance(row.get("_ref_contact_name"), str):
+            return row["_ref_contact_name"]
+        if rt == "Patient" and isinstance(row.get("_ref_patient_name"), str):
+            return row["_ref_patient_name"]
+        # No named referrer — use the type as the name (e.g. "Google",
+        # "Social Media"). This is how most paid channels will show.
+        return row["referral_type"]
+
+    rs["referral_name"] = rs.apply(_name, axis=1)
+
+    # A patient can in theory have multiple referral_source records; keep
+    # the most recent one (by referral_source_id, since there's no date).
+    rs = rs.sort_values("referral_source_id").drop_duplicates(
+        "patient_id", keep="last"
+    )
+    return rs[["patient_id", "referral_type", "referral_name"]]
+
+
 def build_invoice_view(
     invoices: pd.DataFrame,
     patients: pd.DataFrame,
     referral_sources: pd.DataFrame,
+    referral_source_types: pd.DataFrame,
+    contacts: pd.DataFrame,
     businesses: pd.DataFrame,
 ) -> pd.DataFrame:
     """Wide invoice table with patient, referrer, and clinic resolved."""
     if invoices.empty:
         return invoices.assign(
             patient_name="",
-            referral_type="",
-            referral_name="",
+            referral_type="(none)",
+            referral_name="(none)",
             business_name="",
         )
 
@@ -224,19 +334,24 @@ def build_invoice_view(
         patients["first_name"].fillna("") + " " + patients["last_name"].fillna("")
     ).str.strip()
 
+    resolved = _resolve_referral(
+        referral_sources, referral_source_types, patients, contacts
+    )
+
     df = (
         invoices.merge(
-            patients[["patient_id", "patient_name", "referral_source_id"]],
+            patients[["patient_id", "patient_name"]],
             on="patient_id",
             how="left",
         )
-        .merge(referral_sources, on="referral_source_id", how="left")
+        .merge(resolved, on="patient_id", how="left")
         .merge(businesses, on="business_id", how="left")
     )
 
     df["referral_type"] = df["referral_type"].fillna("(none)")
     df["referral_name"] = df["referral_name"].fillna("(none)")
     df["business_name"] = df["business_name"].fillna("(unknown)")
+    df["patient_name"] = df["patient_name"].fillna("")
     return df
 
 
