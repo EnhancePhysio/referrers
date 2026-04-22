@@ -64,10 +64,24 @@ def _client() -> ClinikoClient:
     )
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading businesses…")
+def _missing_snapshot_error(name: str) -> None:
+    """Guide the user to populate a parquet snapshot that doesn't exist yet."""
+    st.error(
+        f"The **{name}** snapshot (`data/{name}.parquet`) doesn't exist yet.\n\n"
+        "Trigger it once manually: GitHub → this repo → **Actions** → "
+        "_Sync Cliniko data_ → **Run workflow**. After it finishes and "
+        "auto-commits, Streamlit will redeploy and this page will work.\n\n"
+        "From then on it refreshes automatically every Friday 18:00 AEST."
+    )
+    st.stop()
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading businesses…")
 def _businesses() -> pd.DataFrame:
     try:
         return load_businesses(_client())
+    except RuntimeError:
+        _missing_snapshot_error("businesses")
     except requests.exceptions.SSLError as e:
         st.error(
             f"SSL error connecting to Cliniko at `{_client().base_url}`.\n\n"
@@ -86,14 +100,20 @@ def _businesses() -> pd.DataFrame:
         st.stop()
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading referral sources…")
+@st.cache_data(ttl=86400, show_spinner="Loading referral sources…")
 def _referral_sources() -> pd.DataFrame:
-    return load_referral_sources(_client())
+    try:
+        return load_referral_sources(_client())
+    except RuntimeError:
+        _missing_snapshot_error("referral_sources")
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading patients (one-time, cached for 1 hour)…")
+@st.cache_data(ttl=86400, show_spinner="Loading patients from snapshot…")
 def _patients() -> pd.DataFrame:
-    return load_patients(_client())
+    try:
+        return load_patients(_client())
+    except RuntimeError:
+        _missing_snapshot_error("patients")
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading invoices…")
@@ -153,7 +173,11 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Data is cached for 1 hour. Click refresh to force a reload.")
+    st.caption(
+        "Patients / referrers are served from a cached snapshot that "
+        "auto-refreshes every Friday 18:00 AEST. Invoices are fetched "
+        "live for the selected period and cached for 1 hour."
+    )
 
 
 # --- Load + shape data ----------------------------------------------------
