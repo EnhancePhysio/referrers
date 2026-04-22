@@ -61,20 +61,40 @@ def load_referral_sources(client: ClinikoClient) -> pd.DataFrame:
     )
 
 
+def _patient_row(p: dict) -> dict:
+    return {
+        "patient_id": _id(p["id"]),
+        "first_name": p.get("first_name", ""),
+        "last_name": p.get("last_name", ""),
+        "referral_source_id": _link_id(p.get("referral_source")),
+        "created_at": p.get("created_at"),
+    }
+
+
 def load_patients(client: ClinikoClient) -> pd.DataFrame:
-    rows = client.patients()
-    out = []
-    for p in rows:
-        out.append(
-            {
-                "patient_id": _id(p["id"]),
-                "first_name": p.get("first_name", ""),
-                "last_name": p.get("last_name", ""),
-                "referral_source_id": _link_id(p.get("referral_source")),
-                "created_at": p.get("created_at"),
-            }
-        )
-    return pd.DataFrame(out)
+    """Load every patient. Slow on large practices — prefer
+    ``load_patients_by_ids`` when you only need a subset."""
+    return pd.DataFrame([_patient_row(p) for p in client.patients()])
+
+
+def load_patients_by_ids(
+    client: ClinikoClient,
+    patient_ids: list[str],
+) -> pd.DataFrame:
+    """Fetch only the patients we actually need (those with invoices in the
+    selected period). Much faster than ``load_patients`` for a quarterly
+    view, as long as the set is a small fraction of the full patient list."""
+    rows = []
+    for pid in patient_ids:
+        if not pid:
+            continue
+        try:
+            rows.append(_patient_row(client.get(f"patients/{pid}")))
+        except Exception:
+            # If a patient lookup fails (e.g. archived + inaccessible),
+            # skip — their invoice will still appear with a blank referrer.
+            continue
+    return pd.DataFrame(rows)
 
 
 def load_invoices(
