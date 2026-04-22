@@ -14,7 +14,30 @@ import requests
 class ClinikoClient:
     """Minimal Cliniko API client with pagination and basic rate-limit handling."""
 
+    # Valid Cliniko shards — used to catch placeholder values and typos.
+    _VALID_SHARDS = {
+        "au1", "au2", "au3", "au4",
+        "uk1", "uk2",
+        "us1",
+        "ca1",
+    }
+
     def __init__(self, api_key: str, user_agent: str, shard: str | None = None):
+        # Strip whitespace — API keys pasted into Streamlit Secrets sometimes
+        # pick up a trailing newline or space, which breaks shard derivation.
+        api_key = (api_key or "").strip()
+        if not api_key:
+            raise ValueError("cliniko_api_key is empty.")
+
+        # Catch the common mistake of leaving the placeholder from the
+        # secrets.toml template in place.
+        if "PASTE" in api_key.upper() or "YOUR" in api_key.upper():
+            raise ValueError(
+                "cliniko_api_key still contains placeholder text "
+                "(e.g. 'PASTE-YOUR-NEW-CLINIKO-KEY-HERE'). "
+                "Paste your real Cliniko API key into Streamlit Secrets."
+            )
+
         # Cliniko API keys are of the form "<key>-<shard>" e.g. "...-au1".
         # Derive shard from the key if not explicitly provided.
         if shard is None:
@@ -23,8 +46,17 @@ class ClinikoClient:
                     "Could not derive shard from API key. "
                     "Pass shard explicitly (e.g. 'au1')."
                 )
-            shard = api_key.rsplit("-", 1)[-1]
+            shard = api_key.rsplit("-", 1)[-1].strip().lower()
 
+        if shard not in self._VALID_SHARDS:
+            raise ValueError(
+                f"Derived Cliniko shard '{shard}' is not a known shard "
+                f"(expected one of {sorted(self._VALID_SHARDS)}). "
+                "Check that your cliniko_api_key in Streamlit Secrets is "
+                "a real key and ends in the shard code, e.g. '...-au1'."
+            )
+
+        self.shard = shard
         self.base_url = f"https://api.{shard}.cliniko.com/v1"
         self.session = requests.Session()
         self.session.auth = (api_key, "")
@@ -96,9 +128,13 @@ class ClinikoClient:
     def referral_sources(self) -> list[dict]:
         return list(self.paginate("referral_sources"))
 
-    def patients(self, archived: bool = False) -> list[dict]:
-        params = {} if archived else {"q[]": "archived_at:blank"}
-        return list(self.paginate("patients", params=params))
+    def patients(self) -> list[dict]:
+        """All patients (including archived — their invoice history still counts)."""
+        return list(self.paginate("patients"))
+
+    def patient(self, patient_id: str) -> dict:
+        """Fetch a single patient by ID."""
+        return self.get(f"patients/{patient_id}")
 
     def invoices(self, issued_from: str, issued_to: str) -> list[dict]:
         """Invoices issued between two dates (YYYY-MM-DD, inclusive)."""
