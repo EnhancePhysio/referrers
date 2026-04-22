@@ -151,7 +151,18 @@ class ClinikoClient:
         return list(self.paginate("businesses"))
 
     def referral_sources(self) -> list[dict]:
+        """Per-patient referral_source junction records."""
         return list(self.paginate("referral_sources"))
+
+    def referral_source_types(self) -> list[dict]:
+        """The small lookup table of referrer *categories*
+        (Google, Contact, Patient, Social Media, etc.)."""
+        return list(self.paginate("referral_source_types"))
+
+    def contacts(self) -> list[dict]:
+        """Contacts — these are the named referrers when a patient's
+        referral_source has referrer_type='Contact' (e.g. 'Dr Smith')."""
+        return list(self.paginate("contacts"))
 
     def patients(self) -> list[dict]:
         """All patients (including archived — their invoice history still counts)."""
