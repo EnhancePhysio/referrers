@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from cliniko_client import ClinikoClient
@@ -15,7 +16,7 @@ from data import (
     channel_rollup,
     load_businesses,
     load_invoices,
-    load_patients,
+    load_patients_by_ids,
     load_referral_sources,
     referrer_league_table,
 )
@@ -65,7 +66,24 @@ def _client() -> ClinikoClient:
 
 @st.cache_data(ttl=3600, show_spinner="Loading businesses…")
 def _businesses() -> pd.DataFrame:
-    return load_businesses(_client())
+    try:
+        return load_businesses(_client())
+    except requests.exceptions.SSLError as e:
+        st.error(
+            f"SSL error connecting to Cliniko at `{_client().base_url}`.\n\n"
+            f"Full error: `{type(e).__name__}: {e}`\n\n"
+            "Check: (1) the shard in your API key matches your Cliniko URL "
+            "(yours should end in `-au1`), and (2) the app has a fresh CA "
+            "bundle (ensure `certifi` is in requirements.txt)."
+        )
+        st.stop()
+    except requests.exceptions.HTTPError as e:
+        st.error(
+            f"Cliniko returned HTTP {e.response.status_code} at "
+            f"`{_client().base_url}/businesses`.\n\n"
+            f"Response body: `{e.response.text[:500]}`"
+        )
+        st.stop()
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading referral sources…")
@@ -73,14 +91,15 @@ def _referral_sources() -> pd.DataFrame:
     return load_referral_sources(_client())
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading patients…")
-def _patients() -> pd.DataFrame:
-    return load_patients(_client())
-
-
 @st.cache_data(ttl=3600, show_spinner="Loading invoices…")
 def _invoices(start: date, end: date) -> pd.DataFrame:
     return load_invoices(_client(), start, end)
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading patient records for invoiced patients…")
+def _patients_for_invoices(patient_ids: tuple[str, ...]) -> pd.DataFrame:
+    # ``patient_ids`` must be hashable (tuple) so Streamlit can cache on it.
+    return load_patients_by_ids(_client(), list(patient_ids))
 
 
 # --- Sidebar: period + clinic filter --------------------------------------
@@ -141,8 +160,18 @@ with st.sidebar:
 # --- Load + shape data ----------------------------------------------------
 
 referral_sources = _referral_sources()
-patients = _patients()
 invoices = _invoices(start_date, end_date)
+
+# Only fetch the patient records we actually need — patients with invoices
+# in the selected period. Massive speedup vs. loading every patient.
+invoiced_ids = tuple(sorted({pid for pid in invoices["patient_id"].dropna().tolist()}))
+patients = (
+    _patients_for_invoices(invoiced_ids)
+    if invoiced_ids
+    else pd.DataFrame(columns=["patient_id", "first_name", "last_name",
+                               "referral_source_id", "created_at"])
+)
+
 invoice_view = build_invoice_view(invoices, patients, referral_sources, businesses)
 
 if clinic_choice != "All":
