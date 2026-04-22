@@ -1,3 +1,8 @@
 streamlit>=1.33
 pandas>=2.1
+pyarrow>=15.0  # parquet I/O for the cached Cliniko snapshots
 requests>=2.31
+# Pin recent certifi + urllib3 — Streamlit Cloud's base image sometimes ships
+# older CA bundles, which can cause SSL verification failures against Cliniko.
+certifi>=2024.7.4
+urllib3>=2.2.2
