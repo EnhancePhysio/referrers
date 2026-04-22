@@ -67,20 +67,54 @@ class ClinikoClient:
             }
         )
 
-    def get(self, path: str, params: dict | None = None) -> dict:
-        """GET a single resource / page. Retries once on 429."""
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        for attempt in range(3):
-            resp = self.session.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                # Rate-limited — honour Retry-After if present.
-                retry_after = int(resp.headers.get("Retry-After", "5"))
-                time.sleep(retry_after)
+    # Inter-request delay (seconds) — stays well under Cliniko's ~200/min
+    # rate limit without being slow. Set to 0 to disable.
+    _INTER_REQUEST_DELAY = 0.1
+
+    # Max retries for a single request before giving up.
+    _MAX_RETRIES = 10
+
+    def _request_with_retry(self, url: str, params: dict | None = None):
+        """GET with robust 429 + transient-error handling."""
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                time.sleep(min(2 ** attempt, 30))
                 continue
+
+            if resp.status_code == 429:
+                # Honour Retry-After; fall back to exponential backoff.
+                retry_after = resp.headers.get("Retry-After")
+                sleep_for = (
+                    int(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else min(2 ** attempt + 1, 30)
+                )
+                time.sleep(sleep_for)
+                continue
+
+            if 500 <= resp.status_code < 600:
+                # Transient server error — back off and retry.
+                time.sleep(min(2 ** attempt, 30))
+                continue
+
             resp.raise_for_status()
-            return resp.json()
-        resp.raise_for_status()
-        return {}
+            if self._INTER_REQUEST_DELAY:
+                time.sleep(self._INTER_REQUEST_DELAY)
+            return resp
+
+        # Exhausted retries.
+        if last_exc:
+            raise last_exc
+        resp.raise_for_status()  # type: ignore[possibly-unbound]
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        """GET a single resource / page."""
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        return self._request_with_retry(url, params).json()
 
     def paginate(
         self,
@@ -93,17 +127,7 @@ class ClinikoClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
 
         while url:
-            for attempt in range(3):
-                resp = self.session.get(url, params=params, timeout=30)
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
-                    time.sleep(retry_after)
-                    continue
-                resp.raise_for_status()
-                break
-            else:
-                resp.raise_for_status()
-
+            resp = self._request_with_retry(url, params)
             payload = resp.json()
             # The "collection" key in the payload is named after the resource,
             # and is the only list-valued top-level key.
@@ -116,7 +140,8 @@ class ClinikoClient:
             for item in payload[collection_key]:
                 yield item
 
-            # Follow the "next" link for the next page; params already in the URL.
+            # Follow the "next" link for the next page; the next link already
+            # carries all the query params we need.
             url = payload.get("links", {}).get("next")
             params = None
 
