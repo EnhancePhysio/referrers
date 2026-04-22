@@ -1,111 +1,152 @@
 """Data loading + joining layer.
 
-Pulls from the Cliniko API via ClinikoClient and assembles the DataFrames the
-dashboard actually uses: invoices-with-referrer-and-clinic, and a
-referrer-level summary.
+Prefers ``data/*.parquet`` snapshots (populated by ``sync.py`` / GitHub
+Actions) for the slow-to-fetch Cliniko resources: patients, referral
+sources, and businesses. Falls back to live API if a snapshot is missing
+(e.g. very first run before the action has executed).
+
+Invoices are always fetched live — they're small per-quarter and always
+period-specific, so snapshotting adds little.
 """
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from cliniko_client import ClinikoClient
 
+# Snapshots committed to the repo by the sync workflow.
+DATA_DIR = Path(__file__).parent / "data"
+PATIENTS_PQ = DATA_DIR / "patients.parquet"
+REFERRAL_SOURCES_PQ = DATA_DIR / "referral_sources.parquet"
+BUSINESSES_PQ = DATA_DIR / "businesses.parquet"
 
-# Cliniko API returns IDs as strings in "links" but as ints in embedded objects.
-# Normalise everywhere to str for safe joins.
+
+# --- ID helpers ----------------------------------------------------------
+
 def _id(x: Any) -> str | None:
+    """Normalise any scalar id into a string (Cliniko mixes str/int)."""
     if x is None:
         return None
     return str(x)
 
 
-def _link_id(obj, key: str = "self") -> str | None:
-    """Extract the numeric id from a Cliniko relationship field.
+def _link_id(obj: Any, key: str = "self") -> str | None:
+    """Extract the numeric id from a Cliniko relationship field, robustly.
 
-    Cliniko is inconsistent: some endpoints return relationships as a nested
-    object like ``{"links": {"self": "https://…/resource/123"}}``, while
-    others (notably ``/patients``'s ``referral_source``) return a plain URL
-    string. Handle both shapes.
+    Cliniko is inconsistent across endpoints: sometimes a relationship is a
+    nested object ``{"links": {"self": "https://…/resource/123"}}``,
+    sometimes it's a plain URL string (notably ``/patients``'s
+    ``referral_source``), sometimes it's missing/None, and in rare cases
+    it may be a shape we don't expect. Handle all of that without raising
+    — a single weird record shouldn't blow up a full-practice sync.
     """
-    if not obj:
+    if obj is None:
         return None
     if isinstance(obj, str):
-        # Plain URL form: ".../referral_sources/12345"
         tail = obj.rsplit("/", 1)[-1].strip()
         return tail or None
-    link = obj.get("links", {}).get(key)
-    if not link:
-        return None
-    return link.rsplit("/", 1)[-1]
+    if isinstance(obj, dict):
+        links = obj.get("links")
+        if isinstance(links, dict):
+            link = links.get(key)
+            if isinstance(link, str) and link:
+                return link.rsplit("/", 1)[-1]
+    return None
 
 
-def load_businesses(client: ClinikoClient) -> pd.DataFrame:
-    rows = client.businesses()
-    return pd.DataFrame(
-        [
-            {
-                "business_id": _id(b["id"]),
-                "business_name": b.get("business_name") or b.get("label") or "",
-            }
-            for b in rows
-        ]
-    )
-
-
-def load_referral_sources(client: ClinikoClient) -> pd.DataFrame:
-    rows = client.referral_sources()
-    return pd.DataFrame(
-        [
-            {
-                "referral_source_id": _id(r["id"]),
-                "referral_type": r.get("referral_source_type", {}).get("name")
-                or r.get("type")
-                or "",
-                "referral_name": (r.get("name") or "").strip() or "(blank)",
-            }
-            for r in rows
-        ]
-    )
-
+# --- Cliniko → row converters (shared by live + sync paths) -------------
 
 def _patient_row(p: dict) -> dict:
     return {
-        "patient_id": _id(p["id"]),
-        "first_name": p.get("first_name", ""),
-        "last_name": p.get("last_name", ""),
+        "patient_id": _id(p.get("id")),
+        "first_name": p.get("first_name") or "",
+        "last_name": p.get("last_name") or "",
         "referral_source_id": _link_id(p.get("referral_source")),
         "created_at": p.get("created_at"),
+        "updated_at": p.get("updated_at"),
     }
 
 
-def load_patients(client: ClinikoClient) -> pd.DataFrame:
-    """Load every patient. Slow on large practices — prefer
-    ``load_patients_by_ids`` when you only need a subset."""
-    return pd.DataFrame([_patient_row(p) for p in client.patients()])
+def _business_row(b: dict) -> dict:
+    return {
+        "business_id": _id(b.get("id")),
+        "business_name": b.get("business_name") or b.get("label") or "",
+    }
 
 
-def load_patients_by_ids(
+def _referral_source_row(r: dict) -> dict:
+    rs_type = r.get("referral_source_type")
+    if not isinstance(rs_type, dict):
+        rs_type = {}
+    return {
+        "referral_source_id": _id(r.get("id")),
+        "referral_type": rs_type.get("name") or r.get("type") or "",
+        "referral_name": (r.get("name") or "").strip() or "(blank)",
+    }
+
+
+# --- Live Cliniko fetchers (used by sync.py) ----------------------------
+
+def fetch_businesses_live(client: ClinikoClient) -> pd.DataFrame:
+    return pd.DataFrame([_business_row(b) for b in client.businesses()])
+
+
+def fetch_referral_sources_live(client: ClinikoClient) -> pd.DataFrame:
+    return pd.DataFrame(
+        [_referral_source_row(r) for r in client.referral_sources()]
+    )
+
+
+def fetch_patients_live(
     client: ClinikoClient,
-    patient_ids: list[str],
+    updated_since: str | None = None,
 ) -> pd.DataFrame:
-    """Fetch only the patients we actually need (those with invoices in the
-    selected period). Much faster than ``load_patients`` for a quarterly
-    view, as long as the set is a small fraction of the full patient list."""
-    rows = []
-    for pid in patient_ids:
-        if not pid:
-            continue
-        try:
-            rows.append(_patient_row(client.get(f"patients/{pid}")))
-        except Exception:
-            # If a patient lookup fails (e.g. archived + inaccessible),
-            # skip — their invoice will still appear with a blank referrer.
-            continue
-    return pd.DataFrame(rows)
+    """Fetch patients, optionally only those updated since an ISO8601 datetime."""
+    params = None
+    if updated_since:
+        params = {"q[]": [f"updated_at:>={updated_since}"]}
+    return pd.DataFrame(
+        [_patient_row(p) for p in client.paginate("patients", params=params)]
+    )
 
+
+# --- Snapshot-first loaders (used by the dashboard) ---------------------
+
+def load_businesses(client: ClinikoClient | None = None) -> pd.DataFrame:
+    if BUSINESSES_PQ.exists():
+        return pd.read_parquet(BUSINESSES_PQ)
+    if client is None:
+        raise RuntimeError(
+            f"{BUSINESSES_PQ} not found — run `python sync.py` first."
+        )
+    return fetch_businesses_live(client)
+
+
+def load_referral_sources(client: ClinikoClient | None = None) -> pd.DataFrame:
+    if REFERRAL_SOURCES_PQ.exists():
+        return pd.read_parquet(REFERRAL_SOURCES_PQ)
+    if client is None:
+        raise RuntimeError(
+            f"{REFERRAL_SOURCES_PQ} not found — run `python sync.py` first."
+        )
+    return fetch_referral_sources_live(client)
+
+
+def load_patients(client: ClinikoClient | None = None) -> pd.DataFrame:
+    if PATIENTS_PQ.exists():
+        return pd.read_parquet(PATIENTS_PQ)
+    if client is None:
+        raise RuntimeError(
+            f"{PATIENTS_PQ} not found — run `python sync.py` first."
+        )
+    return fetch_patients_live(client)
+
+
+# --- Invoices (always live) ---------------------------------------------
 
 def load_invoices(
     client: ClinikoClient,
@@ -117,7 +158,7 @@ def load_invoices(
     for inv in rows:
         out.append(
             {
-                "invoice_id": _id(inv["id"]),
+                "invoice_id": _id(inv.get("id")),
                 "invoice_number": inv.get("number"),
                 "issue_date": inv.get("issue_date"),
                 "total_incl_tax": float(inv.get("total_including_tax") or 0),
@@ -131,6 +172,8 @@ def load_invoices(
         df["issue_date"] = pd.to_datetime(df["issue_date"]).dt.date
     return df
 
+
+# --- Joining + rollups --------------------------------------------------
 
 def build_invoice_view(
     invoices: pd.DataFrame,
@@ -152,18 +195,14 @@ def build_invoice_view(
         patients["first_name"].fillna("") + " " + patients["last_name"].fillna("")
     ).str.strip()
 
-    df = invoices.merge(
-        patients[["patient_id", "patient_name", "referral_source_id"]],
-        on="patient_id",
-        how="left",
-    ).merge(
-        referral_sources,
-        on="referral_source_id",
-        how="left",
-    ).merge(
-        businesses,
-        on="business_id",
-        how="left",
+    df = (
+        invoices.merge(
+            patients[["patient_id", "patient_name", "referral_source_id"]],
+            on="patient_id",
+            how="left",
+        )
+        .merge(referral_sources, on="referral_source_id", how="left")
+        .merge(businesses, on="business_id", how="left")
     )
 
     df["referral_type"] = df["referral_type"].fillna("(none)")
