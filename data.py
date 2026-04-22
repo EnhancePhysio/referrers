@@ -328,4 +328,116 @@ def _resolve_referral(
         # rt may be pd.NA / None / float NaN — coerce to a plain str first
         # so the equality comparisons can't produce a non-bool value.
         rt = row.get("referrer_type")
-        rt
+        rt_str = rt if isinstance(rt, str) else ""
+        contact_name = row.get("_ref_contact_name")
+        patient_name = row.get("_ref_patient_name")
+        if rt_str == "Contact" and isinstance(contact_name, str):
+            return contact_name
+        if rt_str == "Patient" and isinstance(patient_name, str):
+            return patient_name
+        # No named referrer — use the type as the name (e.g. "Google",
+        # "Social Media"). This is how most paid channels will show.
+        return row["referral_type"]
+
+    rs["referral_name"] = rs.apply(_name, axis=1)
+
+    # A patient can in theory have multiple referral_source records; keep
+    # the most recent one (by referral_source_id, since there's no date).
+    rs = rs.sort_values("referral_source_id").drop_duplicates(
+        "patient_id", keep="last"
+    )
+    return rs[["patient_id", "referral_type", "referral_name"]]
+
+
+def build_invoice_view(
+    invoices: pd.DataFrame,
+    patients: pd.DataFrame,
+    referral_sources: pd.DataFrame,
+    referral_source_types: pd.DataFrame,
+    contacts: pd.DataFrame,
+    businesses: pd.DataFrame,
+) -> pd.DataFrame:
+    """Wide invoice table with patient, referrer, and clinic resolved."""
+    if invoices.empty:
+        return invoices.assign(
+            patient_name="",
+            referral_type="(none)",
+            referral_name="(none)",
+            business_name="",
+        )
+
+    patients = patients.copy()
+    patients["patient_name"] = (
+        patients["first_name"].fillna("") + " " + patients["last_name"].fillna("")
+    ).str.strip()
+
+    resolved = _resolve_referral(
+        referral_sources, referral_source_types, patients, contacts
+    )
+
+    df = (
+        invoices.merge(
+            patients[["patient_id", "patient_name"]],
+            on="patient_id",
+            how="left",
+        )
+        .merge(resolved, on="patient_id", how="left")
+        .merge(businesses, on="business_id", how="left")
+    )
+
+    df["referral_type"] = df["referral_type"].fillna("(none)")
+    df["referral_name"] = df["referral_name"].fillna("(none)")
+    df["business_name"] = df["business_name"].fillna("(unknown)")
+    df["patient_name"] = df["patient_name"].fillna("")
+    return df
+
+
+def referrer_league_table(invoice_view: pd.DataFrame) -> pd.DataFrame:
+    """One row per (clinic, referral_type, referral_name): patients + revenue."""
+    if invoice_view.empty:
+        return pd.DataFrame(
+            columns=[
+                "business_name",
+                "referral_type",
+                "referral_name",
+                "patients_referred",
+                "invoices",
+                "total_revenue",
+                "avg_per_patient",
+            ]
+        )
+
+    grouped = (
+        invoice_view.groupby(
+            ["business_name", "referral_type", "referral_name"], dropna=False
+        )
+        .agg(
+            patients_referred=("patient_id", "nunique"),
+            invoices=("invoice_id", "nunique"),
+            total_revenue=("total_incl_tax", "sum"),
+        )
+        .reset_index()
+    )
+    grouped["avg_per_patient"] = (
+        grouped["total_revenue"] / grouped["patients_referred"].replace(0, pd.NA)
+    ).round(2)
+    return grouped.sort_values(
+        ["business_name", "total_revenue"], ascending=[True, False]
+    )
+
+
+def channel_rollup(invoice_view: pd.DataFrame) -> pd.DataFrame:
+    """One row per (clinic, referral_type): totals across all referrer names."""
+    if invoice_view.empty:
+        return pd.DataFrame()
+    rollup = (
+        invoice_view.groupby(["business_name", "referral_type"], dropna=False)
+        .agg(
+            patients_referred=("patient_id", "nunique"),
+            total_revenue=("total_incl_tax", "sum"),
+        )
+        .reset_index()
+    )
+    return rollup.sort_values(
+        ["business_name", "total_revenue"], ascending=[True, False]
+    )
