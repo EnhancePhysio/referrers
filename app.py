@@ -504,3 +504,59 @@ with st.expander("🔧 Data health diagnostics"):
 
     st.markdown("**Sample — 5 raw invoices (pre-join)**")
     st.dataframe(invoices.head(5), use_container_width=True, hide_index=True)
+
+    # --- Unmatched patients (the "(none)" bucket) ---
+    # For patients in the selected period whose invoices aren't matching
+    # to any referral source. Use this list to spot-check 5–10 of them
+    # in Cliniko and see whether they *should* have a matching source.
+    if not invoice_view.empty:
+        unmatched = (
+            invoice_view[invoice_view["referral_type"] == "(none)"]
+            .groupby("patient_id")
+            .agg(
+                patient_name=("patient_name", "first"),
+                business_name=("business_name", "first"),
+                invoices=("invoice_id", "nunique"),
+                revenue=("total_incl_tax", "sum"),
+            )
+            .reset_index()
+            .sort_values("revenue", ascending=False)
+        )
+        st.markdown(
+            f"**Unmatched patients in period ({len(unmatched):,})** — "
+            "these invoices couldn't be joined to any referral source. "
+            "Click a few of their names and look them up in Cliniko — does "
+            "their patient record actually have a 'How did you find us?' "
+            "referrer set?"
+        )
+        # Also flag how many of these patients DO exist in referral_sources
+        # (if any) — that distinguishes 'no record at all' from 'record
+        # exists but the join is broken'.
+        rs_pids = set(referral_sources["patient_id"].dropna().astype(str)) \
+            if "patient_id" in referral_sources.columns else set()
+        unmatched["in_referral_sources_parquet"] = (
+            unmatched["patient_id"].astype(str).isin(rs_pids)
+        )
+        st.dataframe(
+            unmatched.head(50),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "patient_id": "Patient ID",
+                "patient_name": "Patient",
+                "business_name": "Clinic",
+                "invoices": "Invoices",
+                "revenue": st.column_config.NumberColumn(
+                    "Revenue", format="$%.2f"
+                ),
+                "in_referral_sources_parquet": st.column_config.CheckboxColumn(
+                    "Has RS record?",
+                    help=(
+                        "True = the patient DOES have a record in "
+                        "referral_sources.parquet but the join failed "
+                        "(suggests a bug). False = no record at all "
+                        "(suggests data entry gap or archived record)."
+                    ),
+                ),
+            },
+        )
