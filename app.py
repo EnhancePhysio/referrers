@@ -10,13 +10,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from accounts import ACCOUNTS
 from cliniko_client import ClinikoClient
 from data import (
     build_invoice_view,
     channel_rollup,
     load_businesses,
     load_contacts,
-    load_invoices,
+    load_invoices_multi,
     load_patients,
     load_referral_source_types,
     load_referral_sources,
@@ -56,21 +57,38 @@ _check_password()
 # --- Data loaders (cached) ------------------------------------------------
 
 @st.cache_resource
-def _client() -> ClinikoClient:
-    return ClinikoClient(
-        api_key=st.secrets["cliniko_api_key"],
-        user_agent=st.secrets.get(
-            "cliniko_user_agent",
-            "EnhancePhysio-Dashboard (matt@enhance.physio)",
-        ),
+def _clients() -> dict[str, ClinikoClient]:
+    """Build one ClinikoClient per account whose API key is present in
+    Streamlit Secrets. Accounts with a missing key are silently skipped —
+    the dashboard still renders for whichever accounts are configured."""
+    user_agent = st.secrets.get(
+        "cliniko_user_agent",
+        "EnhancePhysio-Dashboard (matt@enhance.physio)",
     )
+    out: dict[str, ClinikoClient] = {}
+    for account in ACCOUNTS:
+        key = (
+            st.secrets.get(account.secret_env)
+            or st.secrets.get(account.secret_env.lower())
+            or ""
+        )
+        if not key:
+            continue
+        try:
+            out[account.label] = ClinikoClient(api_key=key, user_agent=user_agent)
+        except Exception as e:
+            st.warning(
+                f"Could not initialise Cliniko client for {account.display_name}: {e}"
+            )
+    return out
 
 
 def _missing_snapshot_error(name: str) -> None:
     """Guide the user to populate a parquet snapshot that doesn't exist yet."""
     st.error(
-        f"The **{name}** snapshot (`data/{name}.parquet`) doesn't exist yet.\n\n"
-        "Trigger it once manually: GitHub → this repo → **Actions** → "
+        f"No `{name}.parquet` snapshot found for any account "
+        f"(expected at `data/<account>/{name}.parquet`).\n\n"
+        "Trigger the sync once manually: GitHub → this repo → **Actions** → "
         "_Sync Cliniko data_ → **Run workflow**. After it finishes and "
         "auto-commits, Streamlit will redeploy and this page will work.\n\n"
         "From then on it refreshes automatically every Friday 18:00 AEST."
@@ -81,31 +99,15 @@ def _missing_snapshot_error(name: str) -> None:
 @st.cache_data(ttl=86400, show_spinner="Loading businesses…")
 def _businesses() -> pd.DataFrame:
     try:
-        return load_businesses(_client())
+        return load_businesses()
     except RuntimeError:
         _missing_snapshot_error("businesses")
-    except requests.exceptions.SSLError as e:
-        st.error(
-            f"SSL error connecting to Cliniko at `{_client().base_url}`.\n\n"
-            f"Full error: `{type(e).__name__}: {e}`\n\n"
-            "Check: (1) the shard in your API key matches your Cliniko URL "
-            "(yours should end in `-au1`), and (2) the app has a fresh CA "
-            "bundle (ensure `certifi` is in requirements.txt)."
-        )
-        st.stop()
-    except requests.exceptions.HTTPError as e:
-        st.error(
-            f"Cliniko returned HTTP {e.response.status_code} at "
-            f"`{_client().base_url}/businesses`.\n\n"
-            f"Response body: `{e.response.text[:500]}`"
-        )
-        st.stop()
 
 
 @st.cache_data(ttl=86400, show_spinner="Loading referral sources…")
 def _referral_sources() -> pd.DataFrame:
     try:
-        return load_referral_sources(_client())
+        return load_referral_sources()
     except RuntimeError:
         _missing_snapshot_error("referral_sources")
 
@@ -113,7 +115,7 @@ def _referral_sources() -> pd.DataFrame:
 @st.cache_data(ttl=86400, show_spinner="Loading referral source types…")
 def _referral_source_types() -> pd.DataFrame:
     try:
-        return load_referral_source_types(_client())
+        return load_referral_source_types()
     except RuntimeError:
         _missing_snapshot_error("referral_source_types")
 
@@ -121,7 +123,7 @@ def _referral_source_types() -> pd.DataFrame:
 @st.cache_data(ttl=86400, show_spinner="Loading contacts…")
 def _contacts() -> pd.DataFrame:
     try:
-        return load_contacts(_client())
+        return load_contacts()
     except RuntimeError:
         _missing_snapshot_error("contacts")
 
@@ -129,14 +131,35 @@ def _contacts() -> pd.DataFrame:
 @st.cache_data(ttl=86400, show_spinner="Loading patients from snapshot…")
 def _patients() -> pd.DataFrame:
     try:
-        return load_patients(_client())
+        return load_patients()
     except RuntimeError:
         _missing_snapshot_error("patients")
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading invoices…")
 def _invoices(start: date, end: date) -> pd.DataFrame:
-    return load_invoices(_client(), start, end)
+    clients = _clients()
+    if not clients:
+        st.error(
+            "No Cliniko API keys configured. Add at least one of "
+            f"{[a.secret_env for a in ACCOUNTS]} to Streamlit Secrets."
+        )
+        st.stop()
+    try:
+        return load_invoices_multi(clients, start, end)
+    except requests.exceptions.SSLError as e:
+        st.error(
+            f"SSL error connecting to Cliniko: `{type(e).__name__}: {e}`\n\n"
+            "Check that your API keys end with the correct shard suffix "
+            "(e.g. `-au1`, `-au4`) and that `certifi` is installed."
+        )
+        st.stop()
+    except requests.exceptions.HTTPError as e:
+        st.error(
+            f"Cliniko returned HTTP {e.response.status_code}.\n\n"
+            f"Response body: `{e.response.text[:500]}`"
+        )
+        st.stop()
 
 
 # --- Sidebar: period + clinic filter --------------------------------------
@@ -220,12 +243,22 @@ if clinic_choice != "All":
 
 # --- Header ---------------------------------------------------------------
 
-st.title("Enhance Physio — Referral & ROI Dashboard")
+st.title("Referral & ROI Dashboard")
+
+# Unique patients across multiple accounts must dedup on (account, patient_id)
+# — Cliniko IDs are per-account, so two practices can share the same numeric id.
+if invoice_view.empty:
+    unique_patients = 0
+else:
+    unique_patients = invoice_view.drop_duplicates(
+        ["account", "patient_id"]
+    ).shape[0]
+
 st.caption(
     f"Period: **{start_date.isoformat()} → {end_date.isoformat()}**"
     f" · Clinic: **{clinic_choice}**"
     f" · {len(invoice_view):,} invoices"
-    f" · {invoice_view['patient_id'].nunique():,} unique patients"
+    f" · {unique_patients:,} unique patients"
     f" · ${invoice_view['total_incl_tax'].sum():,.0f} total revenue"
 )
 
@@ -298,13 +331,44 @@ with tab_channels:
 with tab_roi:
     st.subheader("ROI — paid channels only")
     st.caption(
-        "Enter what you spent on each paid channel in this period. "
-        "The table compares spend against revenue attributed to that channel "
-        "(summed across all clinics, since ad spend is typically brand-wide)."
+        "Spend on each paid channel, compared against revenue attributed "
+        "to that channel for the accounts/clinics currently in view. "
+        "Ad-spend defaults come from per-practice sections in Streamlit "
+        "Secrets (e.g. `[ad_spend.enhance]`, `[ad_spend.mudgeeraba]`)."
     )
 
-    # Pull default spend from secrets, if set.
-    defaults: dict = st.secrets.get("ad_spend", {}) if hasattr(st, "secrets") else {}
+    # Determine which accounts contribute revenue to the current view.
+    # (After applying the clinic filter, only some accounts may remain.)
+    accounts_in_view: list[str] = (
+        sorted(invoice_view["account"].dropna().unique().tolist())
+        if not invoice_view.empty and "account" in invoice_view.columns
+        else [a.label for a in ACCOUNTS]
+    )
+
+    # Sum default spend across the in-view accounts. Supports both the
+    # new per-practice layout (recommended) and the legacy flat layout.
+    legacy_defaults: dict = (
+        st.secrets.get("ad_spend", {}) if hasattr(st, "secrets") else {}
+    )
+
+    def _spend_for_channel(channel_key: str) -> float:
+        total = 0.0
+        for label in accounts_in_view:
+            per_account = st.secrets.get("ad_spend", {}).get(label, {}) \
+                if hasattr(st, "secrets") else {}
+            if isinstance(per_account, dict) and channel_key in per_account:
+                total += float(per_account[channel_key])
+            elif label == "enhance" and channel_key in legacy_defaults:
+                # Backwards-compat: the original flat [ad_spend] section
+                # is treated as Enhance's spend.
+                total += float(legacy_defaults[channel_key])
+        return total
+
+    if accounts_in_view:
+        st.caption(
+            "Aggregating ad spend for: "
+            + ", ".join(accounts_in_view)
+        )
 
     # Roll up by channel across the whole (possibly clinic-filtered) view.
     channel_totals = (
@@ -325,7 +389,7 @@ with tab_roi:
     for channel in paid_channels:
         rev = float(paid_totals["revenue"].get(channel, 0))
         patients_n = int(paid_totals["patients"].get(channel, 0))
-        default_spend = float(defaults.get(channel.lower().replace(" ", "_"), 0))
+        default_spend = _spend_for_channel(channel.lower().replace(" ", "_"))
         roi_rows.append(
             {
                 "Channel": channel,
@@ -467,6 +531,29 @@ with st.expander("🔧 Data health diagnostics"):
     )
     col_h.metric("Revenue in period", f"${revenue_total:,.0f}")
 
+    # Per-account row counts — at a glance, see if any practice's sync
+    # is missing or has way less data than expected.
+    st.markdown("**Per-account row counts**")
+    per_acct = []
+    for account in ACCOUNTS:
+        per_acct.append(
+            {
+                "account": account.label,
+                "display_name": account.display_name,
+                "patients": int((patients["account"] == account.label).sum())
+                if "account" in patients.columns else 0,
+                "referral_sources": int((referral_sources["account"] == account.label).sum())
+                if "account" in referral_sources.columns else 0,
+                "contacts": int((contacts["account"] == account.label).sum())
+                if "account" in contacts.columns else 0,
+                "businesses": int((businesses["account"] == account.label).sum())
+                if "account" in businesses.columns else 0,
+                "invoices_in_period": int((invoices["account"] == account.label).sum())
+                if "account" in invoices.columns else 0,
+            }
+        )
+    st.dataframe(pd.DataFrame(per_acct), use_container_width=True, hide_index=True)
+
     # Show each snapshot's *columns* first — this is how we diagnose a
     # schema mismatch (e.g. old parquet with different column names).
     st.markdown("**Snapshot columns** (what's actually in each parquet)")
@@ -512,7 +599,7 @@ with st.expander("🔧 Data health diagnostics"):
     if not invoice_view.empty:
         unmatched = (
             invoice_view[invoice_view["referral_type"] == "(none)"]
-            .groupby("patient_id")
+            .groupby(["account", "patient_id"])
             .agg(
                 patient_name=("patient_name", "first"),
                 business_name=("business_name", "first"),
@@ -531,12 +618,21 @@ with st.expander("🔧 Data health diagnostics"):
         )
         # Also flag how many of these patients DO exist in referral_sources
         # (if any) — that distinguishes 'no record at all' from 'record
-        # exists but the join is broken'.
-        rs_pids = set(referral_sources["patient_id"].dropna().astype(str)) \
-            if "patient_id" in referral_sources.columns else set()
-        unmatched["in_referral_sources_parquet"] = (
-            unmatched["patient_id"].astype(str).isin(rs_pids)
-        )
+        # exists but the join is broken'. Composite (account, patient_id)
+        # because IDs are not unique across accounts.
+        if {"account", "patient_id"}.issubset(referral_sources.columns):
+            rs_pairs = set(
+                zip(
+                    referral_sources["account"].astype(str),
+                    referral_sources["patient_id"].dropna().astype(str),
+                )
+            )
+        else:
+            rs_pairs = set()
+        unmatched["in_referral_sources_parquet"] = [
+            (str(a), str(p)) in rs_pairs
+            for a, p in zip(unmatched["account"], unmatched["patient_id"])
+        ]
         st.dataframe(
             unmatched.head(50),
             use_container_width=True,

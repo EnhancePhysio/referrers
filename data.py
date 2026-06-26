@@ -35,12 +35,18 @@ import pandas as pd
 from cliniko_client import ClinikoClient
 
 # Snapshots committed to the repo by the sync workflow.
+# Multi-account layout: data/<account_label>/<table>.parquet
+# (Older single-file layout — data/<table>.parquet at the root — is no
+# longer read by the dashboard. The sync workflow only writes per-account
+# folders; leftover root files can be deleted but are ignored if present.)
 DATA_DIR = Path(__file__).parent / "data"
-PATIENTS_PQ = DATA_DIR / "patients.parquet"
-REFERRAL_SOURCES_PQ = DATA_DIR / "referral_sources.parquet"
-REFERRAL_SOURCE_TYPES_PQ = DATA_DIR / "referral_source_types.parquet"
-CONTACTS_PQ = DATA_DIR / "contacts.parquet"
-BUSINESSES_PQ = DATA_DIR / "businesses.parquet"
+
+# Filenames inside each per-account folder.
+PATIENTS_FILE = "patients.parquet"
+REFERRAL_SOURCES_FILE = "referral_sources.parquet"
+REFERRAL_SOURCE_TYPES_FILE = "referral_source_types.parquet"
+CONTACTS_FILE = "contacts.parquet"
+BUSINESSES_FILE = "businesses.parquet"
 
 
 # --- ID helpers ----------------------------------------------------------
@@ -167,43 +173,60 @@ def fetch_patients_live(
 
 
 # --- Snapshot-first loaders (used by the dashboard) ---------------------
+# Each loader scans ``data/<account>/<file>`` for every account in
+# ``accounts.ACCOUNTS``, tags rows with the ``account`` label, and
+# concatenates them. A missing folder/file for one account is treated as
+# "not synced yet" — we skip it rather than failing the whole load.
 
-def _load_or_fetch(
-    path: Path,
-    client: ClinikoClient | None,
-    live_fetcher,
-) -> pd.DataFrame:
-    if path.exists():
-        return pd.read_parquet(path)
-    if client is None:
+def _load_per_account(filename: str) -> pd.DataFrame:
+    # Late import to avoid a circular dependency with accounts.py.
+    from accounts import ACCOUNTS
+
+    frames: list[pd.DataFrame] = []
+    missing: list[str] = []
+    for account in ACCOUNTS:
+        path = DATA_DIR / account.label / filename
+        if not path.exists():
+            missing.append(account.label)
+            continue
+        df = pd.read_parquet(path)
+        if df.empty:
+            df = pd.DataFrame()
+        df["account"] = account.label
+        frames.append(df)
+
+    if not frames:
+        # Nothing on disk for ANY account — tell the dashboard so it can
+        # show a friendly "run the sync first" message instead of dying
+        # on an empty merge.
         raise RuntimeError(
-            f"{path} not found — run `python sync.py` first."
+            f"No snapshot found for {filename} in any account folder under "
+            f"{DATA_DIR}. Run `python sync.py` (or trigger the GitHub Actions "
+            f"workflow) first. Missing: {missing}"
         )
-    return live_fetcher(client)
+    return pd.concat(frames, ignore_index=True)
 
 
 def load_businesses(client: ClinikoClient | None = None) -> pd.DataFrame:
-    return _load_or_fetch(BUSINESSES_PQ, client, fetch_businesses_live)
+    return _load_per_account(BUSINESSES_FILE)
 
 
 def load_referral_sources(client: ClinikoClient | None = None) -> pd.DataFrame:
-    return _load_or_fetch(REFERRAL_SOURCES_PQ, client, fetch_referral_sources_live)
+    return _load_per_account(REFERRAL_SOURCES_FILE)
 
 
 def load_referral_source_types(
     client: ClinikoClient | None = None,
 ) -> pd.DataFrame:
-    return _load_or_fetch(
-        REFERRAL_SOURCE_TYPES_PQ, client, fetch_referral_source_types_live
-    )
+    return _load_per_account(REFERRAL_SOURCE_TYPES_FILE)
 
 
 def load_contacts(client: ClinikoClient | None = None) -> pd.DataFrame:
-    return _load_or_fetch(CONTACTS_PQ, client, fetch_contacts_live)
+    return _load_per_account(CONTACTS_FILE)
 
 
 def load_patients(client: ClinikoClient | None = None) -> pd.DataFrame:
-    return _load_or_fetch(PATIENTS_PQ, client, fetch_patients_live)
+    return _load_per_account(PATIENTS_FILE)
 
 
 # --- Invoices (always live) ---------------------------------------------
@@ -221,6 +244,8 @@ def load_invoices(
     start: date,
     end: date,
 ) -> pd.DataFrame:
+    """Single-account invoice loader. Use ``load_invoices_multi`` from the
+    dashboard so account-tagging happens uniformly."""
     rows = client.invoices(start.isoformat(), end.isoformat())
     out = []
     for inv in rows:
@@ -257,6 +282,42 @@ def load_invoices(
     return df
 
 
+def load_invoices_multi(
+    clients_by_account: dict[str, ClinikoClient],
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    """Fetch invoices from every account whose key is present, tag each
+    row with ``account``, and return one concatenated DataFrame.
+
+    Accounts whose Cliniko key isn't configured in Streamlit Secrets are
+    silently skipped — the dashboard still renders for whichever accounts
+    are available. Network/API errors raise: the dashboard already wraps
+    this call in a try/except that surfaces a friendly message.
+    """
+    frames: list[pd.DataFrame] = []
+    for label, client in clients_by_account.items():
+        df = load_invoices(client, start, end)
+        if df.empty:
+            df = pd.DataFrame(
+                columns=[
+                    "invoice_id", "invoice_number", "issue_date",
+                    "total_incl_tax", "patient_id", "business_id", "status",
+                ]
+            )
+        df["account"] = label
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "invoice_id", "invoice_number", "issue_date",
+                "total_incl_tax", "patient_id", "business_id", "status",
+                "account",
+            ]
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 # --- Joining + rollups --------------------------------------------------
 
 def _ensure_cols(df: pd.DataFrame, cols: dict[str, Any]) -> pd.DataFrame:
@@ -276,12 +337,16 @@ def _resolve_referral(
     patients_named: pd.DataFrame,
     contacts: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Flatten each referral_source record into a patient-keyed table
-    carrying ``referral_type`` (category name) and ``referral_name``
-    (specific referrer, or same as type if no named referrer)."""
+    """Flatten each referral_source record into a (account, patient)-keyed
+    table carrying ``referral_type`` (category name) and ``referral_name``
+    (specific referrer, or same as type if no named referrer).
+
+    All joins are composite on (account, id) because Cliniko IDs are only
+    unique within an account — Mudgeeraba patient 1234 ≠ Enhance patient
+    1234, and we must not let them collide."""
     if referral_sources.empty:
         return pd.DataFrame(
-            columns=["patient_id", "referral_type", "referral_name"]
+            columns=["account", "patient_id", "referral_type", "referral_name"]
         )
 
     # Guard against empty / schema-less snapshots for the three lookup
@@ -290,6 +355,7 @@ def _resolve_referral(
     referral_sources = _ensure_cols(
         referral_sources,
         {
+            "account": pd.NA,
             "patient_id": pd.NA,
             "referral_source_type_id": pd.NA,
             "referrer_type": pd.NA,
@@ -299,30 +365,30 @@ def _resolve_referral(
     )
     referral_source_types = _ensure_cols(
         referral_source_types,
-        {"referral_source_type_id": pd.NA, "referral_type_name": pd.NA},
+        {"account": pd.NA, "referral_source_type_id": pd.NA, "referral_type_name": pd.NA},
     )
     contacts = _ensure_cols(
-        contacts, {"contact_id": pd.NA, "contact_name": pd.NA}
+        contacts, {"account": pd.NA, "contact_id": pd.NA, "contact_name": pd.NA}
     )
 
     rs = referral_sources.merge(
         referral_source_types,
-        on="referral_source_type_id",
+        on=["account", "referral_source_type_id"],
         how="left",
     )
     rs["referral_type"] = rs["referral_type_name"].fillna("(unknown type)")
 
     # Resolve the NAME of the specific referrer based on referrer_type.
     # Merge in the contact names and patient names, then coalesce.
-    patient_names = patients_named[["patient_id", "patient_name"]].rename(
+    patient_names = patients_named[["account", "patient_id", "patient_name"]].rename(
         columns={"patient_id": "referrer_id", "patient_name": "_ref_patient_name"}
     )
-    contact_names = contacts[["contact_id", "contact_name"]].rename(
+    contact_names = contacts[["account", "contact_id", "contact_name"]].rename(
         columns={"contact_id": "referrer_id", "contact_name": "_ref_contact_name"}
     )
 
-    rs = rs.merge(contact_names, on="referrer_id", how="left")
-    rs = rs.merge(patient_names, on="referrer_id", how="left")
+    rs = rs.merge(contact_names, on=["account", "referrer_id"], how="left")
+    rs = rs.merge(patient_names, on=["account", "referrer_id"], how="left")
 
     def _name(row):
         # rt may be pd.NA / None / float NaN — coerce to a plain str first
@@ -343,10 +409,11 @@ def _resolve_referral(
 
     # A patient can in theory have multiple referral_source records; keep
     # the most recent one (by referral_source_id, since there's no date).
+    # Composite dedup key — same account+patient, latest source.
     rs = rs.sort_values("referral_source_id").drop_duplicates(
-        "patient_id", keep="last"
+        ["account", "patient_id"], keep="last"
     )
-    return rs[["patient_id", "referral_type", "referral_name"]]
+    return rs[["account", "patient_id", "referral_type", "referral_name"]]
 
 
 def build_invoice_view(
@@ -357,7 +424,11 @@ def build_invoice_view(
     contacts: pd.DataFrame,
     businesses: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Wide invoice table with patient, referrer, and clinic resolved."""
+    """Wide invoice table with patient, referrer, and clinic resolved.
+
+    Every input DataFrame carries an ``account`` column; every join is
+    composite on (account, id) so cross-account ID collisions are impossible.
+    """
     if invoices.empty:
         return invoices.assign(
             patient_name="",
@@ -377,12 +448,12 @@ def build_invoice_view(
 
     df = (
         invoices.merge(
-            patients[["patient_id", "patient_name"]],
-            on="patient_id",
+            patients[["account", "patient_id", "patient_name"]],
+            on=["account", "patient_id"],
             how="left",
         )
-        .merge(resolved, on="patient_id", how="left")
-        .merge(businesses, on="business_id", how="left")
+        .merge(resolved, on=["account", "patient_id"], how="left")
+        .merge(businesses, on=["account", "business_id"], how="left")
     )
 
     df["referral_type"] = df["referral_type"].fillna("(none)")
