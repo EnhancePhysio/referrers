@@ -30,7 +30,12 @@ jobs:
 
       - name: Run Cliniko sync
         env:
-          CLINIKO_API_KEY: ${{ secrets.CLINIKO_API_KEY }}
+          # One secret per Cliniko account. Names match accounts.py.
+          # Missing keys cause that account to be skipped (warning, not error)
+          # so the workflow still succeeds if you've only added some of them.
+          CLINIKO_API_KEY_ENHANCE: ${{ secrets.CLINIKO_API_KEY_ENHANCE }}
+          CLINIKO_API_KEY_MUDGEERABA: ${{ secrets.CLINIKO_API_KEY_MUDGEERABA }}
+          CLINIKO_API_KEY_MULGRAVE: ${{ secrets.CLINIKO_API_KEY_MULGRAVE }}
           CLINIKO_USER_AGENT: "EnhancePhysio-Dashboard-Sync (matt@enhance.physio)"
         run: python sync.py
 
@@ -38,10 +43,22 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/*.parquet
+          # Per-account folders: data/<account>/*.parquet
+          git add data/
           if git diff --cached --quiet; then
             echo "No changes to commit."
-          else
-            git commit -m "chore(sync): refresh Cliniko snapshots ($(date -u +'%Y-%m-%d %H:%MZ'))"
-            git push
+            exit 0
           fi
+          git commit -m "chore(sync): refresh Cliniko snapshots ($(date -u +'%Y-%m-%d %H:%MZ'))"
+          # Retry push up to 3 times with rebase — handles the case where
+          # a concurrent commit landed on main while the sync was running.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed on attempt $attempt; pulling --rebase and retrying…"
+            git pull --rebase --autostash
+          done
+          echo "Push failed after 3 attempts." >&2
+          exit 1
